@@ -1,20 +1,20 @@
-import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.nn import GCNConv, global_mean_pool
 
-class Model(nn.Module):
-    def __init__(self, vocab_size, dim=64):
+
+class GNNClassifier(nn.Module):
+    def __init__(self, vocab_size, hidden_dim=64, num_classes=2):
         super().__init__()
-        self.emb  = nn.Embedding(vocab_size, dim)
-        self.gcn1 = GCNConv(dim, dim)
-        self.gcn2 = GCNConv(dim, dim)
-        self.cls  = nn.Linear(dim, 2)  # binary defect label
+        self.embedding = nn.Embedding(vocab_size, hidden_dim)
+        self.conv1 = GCNConv(hidden_dim, hidden_dim)
+        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.lin = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, data):
-        x = self.emb(data.x)                  # [num_nodes, dim]
-        x = self.gcn1(x, data.edge_index).relu()
-        x = self.gcn2(x, data.edge_index).relu()
-        x = global_mean_pool(x, data.batch)   # [batch_size, dim]
-        return self.cls(x)
-
-#model = Model(vocab_size)
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = self.embedding(x)
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.relu(self.conv2(x, edge_index))
+        x = global_mean_pool(x, batch)
+        return self.lin(x)
