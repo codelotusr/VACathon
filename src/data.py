@@ -11,7 +11,12 @@ import torch
 from datasets import Dataset, IterableDataset, load_dataset
 from torch_geometric.data import Data
 
-from .ast_utils import ast_nodes_and_edges, make_parser
+from .ast_utils import (
+    ast_nodes_and_edges,
+    ast_nodes_and_edges_with_types,
+    make_parser,
+    normalize_code,
+)
 
 # -------------------
 # Defaults / config
@@ -83,13 +88,14 @@ def edges_to_edge_index(edges: List[Tuple[int, int]], n: int) -> torch.Tensor:
 
 def _fallback_graph(
     code: str, max_tokens: int = 512
-) -> Tuple[List[str], List[Tuple[int, int]]]:
+) -> Tuple[List[str], List[Tuple[int, int]], List[int]]:
     toks = [t for t in code.replace("\n", " ").split(" ") if t]
     if not toks:
-        return ["<EMPTY_FUNC>"], []
+        return ["<EMPTY_FUNC>"], [], []
     toks = toks[:max_tokens]
     edges = [(i, i + 1) for i in range(len(toks) - 1)]
-    return toks, edges
+    etypes = [1] * len(edges)  # sequential only
+    return toks, edges, etypes
 
 
 # -------------------
@@ -146,6 +152,7 @@ def build_vocab_streaming(
 
         for code, _label, lang in codes:
             parser = c_parser if lang == "c" else cpp_parser
+            # For vocab speed, the simpler extractor is fine
             node_types, edges = ast_nodes_and_edges(code, parser, max_nodes=max_nodes)
             if not node_types:
                 other = cpp_parser if parser is c_parser else c_parser
@@ -153,7 +160,7 @@ def build_vocab_streaming(
                     code, other, max_nodes=max_nodes
                 )
             if not node_types:
-                node_types, edges = _fallback_graph(code)
+                node_types, edges, _et = _fallback_graph(code)
                 if not node_types:
                     stats["fallback_fail"] += 1
                     continue
@@ -227,26 +234,59 @@ def write_split(
 
         for code, label, lang in codes:
             parser = c_parser if lang == "c" else cpp_parser
-            node_types, edges = ast_nodes_and_edges(code, parser, max_nodes=max_nodes)
+
+            # --- NEW: light normalization helps reduce noisy parse tokens ---
+            code_n = normalize_code(code)
+
+            # Build multi-relation graph (AST/seq/sibling/ident)
+            node_types, edges, edge_types = ast_nodes_and_edges_with_types(
+                code_n, parser, max_nodes=max_nodes
+            )
             if not node_types:
+                # try other language parser
                 other = cpp_parser if parser is c_parser else c_parser
-                node_types, edges = ast_nodes_and_edges(
-                    code, other, max_nodes=max_nodes
+                node_types, edges, edge_types = ast_nodes_and_edges_with_types(
+                    code_n, other, max_nodes=max_nodes
                 )
+
             if not node_types:
-                node_types, edges = _fallback_graph(code)
+                # final fallback: token chain
+                node_types, edges, edge_types = _fallback_graph(code_n)
                 if not node_types:
                     stats["fallback_fail"] += 1
                     continue
 
             if add_seq_edges and node_types:
-                edges = edges + [(j, j + 1) for j in range(len(node_types) - 1)]
+                # already included in _with_types; keep for backward-compat if flag is used
+                pass
 
             x = torch.tensor([vocab.get(t, 0) for t in node_types], dtype=torch.long)
             edge_index = edges_to_edge_index(edges, len(node_types))
+
+            # Align edge_types with filtered edge_index
+            if len(edges) == edge_index.shape[1]:
+                et = torch.tensor(edge_types, dtype=torch.long)
+            else:
+                # recompute kept types for valid edges
+                keep: List[int] = []
+                k = 0
+                for a, b in edges:
+                    if 0 <= a < len(node_types) and 0 <= b < len(node_types):
+                        keep.append(edge_types[k])
+                    k += 1
+                et = torch.tensor(keep, dtype=torch.long)
+                if et.numel() != edge_index.shape[1]:
+                    et = et[: edge_index.shape[1]]
+
             y = torch.tensor([label], dtype=torch.long)
             graphs.append(
-                Data(x=x, edge_index=edge_index, y=y, num_nodes=len(node_types))
+                Data(
+                    x=x,
+                    edge_index=edge_index,
+                    edge_type=et,
+                    y=y,
+                    num_nodes=len(node_types),
+                )
             )
             stats["ok"] += 1
 
