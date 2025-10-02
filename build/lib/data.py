@@ -80,8 +80,6 @@ def parse_split(
         label = _extract_label(row)
 
         node_types, edges = ast_nodes_and_edges(code, parser)
-        if not node_types:
-            node_types, edges = _fallback_graph(code)
         if node_types:
             out.append((node_types, edges, label))
 
@@ -108,16 +106,6 @@ def _extract_label(row: Any) -> int:
                     continue
     # Default to benign
     return 0
-
-
-def _fallback_graph(code: str, max_nodes: int = 512) -> Tuple[List[str], List[Tuple[int, int]]]:
-    tokens = [tok for tok in code.replace("\n", " ").split(" ") if tok]
-    if not tokens:
-        return ["<EMPTY_FUNC>"], []
-
-    tokens = tokens[:max_nodes]
-    edges = [(i, i + 1) for i in range(len(tokens) - 1)]
-    return tokens, edges
 
 
 def write_split(records, vocab: dict, out_path: Path):
