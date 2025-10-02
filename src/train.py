@@ -1,16 +1,20 @@
 import argparse
 import json
+from pathlib import Path
 
 import torch
+from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
 from .model import GNNClassifier
 
 
 def load_data(data_dir="data/processed", batch_size=32):
-    train_graphs = torch.load(f"{data_dir}/train.pt")
-    val_graphs = torch.load(f"{data_dir}/validation.pt")
-    test_graphs = torch.load(f"{data_dir}/test.pt")
+    torch.serialization.add_safe_globals([Data])
+
+    train_graphs = torch.load(f"{data_dir}/train.pt", weights_only=False)
+    val_graphs = torch.load(f"{data_dir}/validation.pt", weights_only=False)
+    test_graphs = torch.load(f"{data_dir}/test.pt", weights_only=False)
 
     return (
         DataLoader(train_graphs, batch_size=batch_size, shuffle=True),
@@ -70,6 +74,7 @@ def train_model(
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
+            Path(ckpt_path).parent.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), ckpt_path)
             print(f"Saved new best model to {ckpt_path}")
 
