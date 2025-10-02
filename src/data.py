@@ -5,7 +5,7 @@ import argparse
 import json
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Tuple, Union
+from typing import Any, Dict, Iterator, List, Tuple
 
 import torch
 from datasets import Dataset, IterableDataset, load_dataset
@@ -19,9 +19,7 @@ from .ast_utils import ast_nodes_and_edges, make_parser
 DEFAULT_HF_ID = "bstee615/bigvul"
 VALID_SPLITS = ("train", "validation", "test")
 
-# Candidate columns used across variants of Big-Vul or mirrors
-CODE_FIELDS: Tuple[str, ...] = ("func", "code", "function", "functionSource")
-LABEL_FIELDS: Tuple[str, ...] = ("target", "label", "vul")
+# Fallback heuristics (only used if func_before/func_after missing)
 LANG_FIELDS: Tuple[str, ...] = ("lang", "language")
 PATH_FIELDS: Tuple[str, ...] = ("path", "filepath", "file", "filename")
 
@@ -29,39 +27,48 @@ PATH_FIELDS: Tuple[str, ...] = ("path", "filepath", "file", "filename")
 # -------------------
 # Small helpers
 # -------------------
-def _first_present(row: Dict[str, Any], names: Tuple[str, ...]) -> Any:
-    for n in names:
-        if n in row and row[n] is not None:
-            return row[n]
-    return None
-
-
-def _extract_label(row: Dict[str, Any]) -> int:
-    v = _first_present(row, LABEL_FIELDS)
-    try:
-        return int(v) if v is not None else 0
-    except Exception:
-        return 0
+def _infer_lang_from_strings(value: str | None) -> str:
+    if not isinstance(value, str):
+        return "c"
+    lv = value.lower()
+    if "cpp" in lv or "c++" in lv:
+        return "cpp"
+    if lv.endswith((".cpp", ".cc", ".cxx", ".hpp", ".hh")):
+        return "cpp"
+    return "c"
 
 
 def _infer_lang(row: Dict[str, Any]) -> str:
-    # explicit column
-    v = _first_present(row, LANG_FIELDS)
-    if isinstance(v, str):
-        lv = v.lower()
-        if "cpp" in lv or "c++" in lv:
-            return "cpp"
-        if lv == "c":
-            return "c"
-    # infer from path
-    v = _first_present(row, PATH_FIELDS)
-    if isinstance(v, str):
-        lv = v.lower()
-        if lv.endswith((".cpp", ".cc", ".cxx", ".hpp", ".hh")):
-            return "cpp"
-        if lv.endswith((".c", ".h")):
-            return "c"
+    # Prefer explicit 'lang'
+    lang = row.get("lang")
+    if isinstance(lang, str):
+        return _infer_lang_from_strings(lang)
+    # Fall back to file path style fields
+    for k in PATH_FIELDS:
+        if isinstance(row.get(k), str):
+            return _infer_lang_from_strings(row[k])
     return "c"
+
+
+def _codes_from_row(row: Dict[str, Any]) -> list[tuple[str, int, str]]:
+    """
+    Big-Vul row -> [(code, label, lang), ...]
+    - func_before -> label 1 (vulnerable)
+    - func_after  -> label 0 (safe)
+    If 'lang' present, use it; else infer from path; default 'c'.
+    """
+    out: list[tuple[str, int, str]] = []
+    lang = _infer_lang(row)
+
+    fb = row.get("func_before")
+    if isinstance(fb, str) and fb.strip():
+        out.append((fb, 1, lang))
+
+    fa = row.get("func_after")
+    if isinstance(fa, str) and fa.strip():
+        out.append((fa, 0, lang))
+
+    return out
 
 
 def edges_to_edge_index(edges: List[Tuple[int, int]], n: int) -> torch.Tensor:
@@ -116,7 +123,7 @@ def iter_split(
 
 
 # -------------------
-# Vocab (streaming over train once)
+# Vocab (single pass over train)
 # -------------------
 def build_vocab_streaming(
     hf_id: str,
@@ -124,36 +131,40 @@ def build_vocab_streaming(
     min_freq: int,
     streaming: bool,
     limit: int | None,
-    seq_edges: bool,
+    add_seq_edges: bool,
 ) -> Dict[str, int]:
-    """
-    Single pass over TRAIN split; parse ASTs and count node types.
-    Memory efficient (keeps just a Counter).
-    """
     c_parser = make_parser("c")
     cpp_parser = make_parser("cpp")
     counter: Counter[str] = Counter()
+    stats = Counter()
 
     for row in iter_split(hf_id, "train", limit, streaming):
-        code = _first_present(row, CODE_FIELDS)
-        if not isinstance(code, str) or code.strip() == "":
+        codes = _codes_from_row(row)
+        if not codes:
+            stats["no_code"] += 1
             continue
-        lang = _infer_lang(row)
-        parser = c_parser if lang == "c" else cpp_parser
 
-        node_types, edges = ast_nodes_and_edges(code, parser, max_nodes=max_nodes)
-        if not node_types:
-            # try other language parser before fallback
-            other = cpp_parser if parser is c_parser else c_parser
-            node_types, edges = ast_nodes_and_edges(code, other, max_nodes=max_nodes)
-        if not node_types:
-            node_types, edges = _fallback_graph(code)
+        for code, _label, lang in codes:
+            parser = c_parser if lang == "c" else cpp_parser
+            node_types, edges = ast_nodes_and_edges(code, parser, max_nodes=max_nodes)
+            if not node_types:
+                other = cpp_parser if parser is c_parser else c_parser
+                node_types, edges = ast_nodes_and_edges(
+                    code, other, max_nodes=max_nodes
+                )
+            if not node_types:
+                node_types, edges = _fallback_graph(code)
+                if not node_types:
+                    stats["fallback_fail"] += 1
+                    continue
 
-        # optional sequential edges (doesn't affect vocab, but we keep the same logic between passes)
-        if seq_edges and node_types:
-            edges = edges + [(i, i + 1) for i in range(len(node_types) - 1)]
+            if add_seq_edges and node_types:
+                edges = edges + [(i, i + 1) for i in range(len(node_types) - 1)]
 
-        counter.update(node_types)
+            counter.update(node_types)
+            stats["ok"] += 1
+
+    print(f"[train] vocab pass stats: {dict(stats)}")
 
     vocab: Dict[str, int] = {"<UNK>": 0}
     for t, c in counter.items():
@@ -174,7 +185,7 @@ def write_split(
     streaming: bool,
     limit: int | None,
     shard_size: int,
-    seq_edges: bool,
+    add_seq_edges: bool,
 ) -> Tuple[int, List[Path]]:
     """
     Iterates a split, parses & encodes graphs, and writes shards:
@@ -188,13 +199,13 @@ def write_split(
     graphs: List[Data] = []
     shard_idx = 0
     n_written = 0
+    stats = Counter()
 
     def _flush():
         nonlocal graphs, shard_idx, paths, n_written
         if not graphs:
             return
         if shard_idx == 0:
-            # if only one shard at the end, we'll overwrite to base; here we tentatively shard
             shard_path = (
                 out_base
                 if len(graphs) < shard_size and n_written == 0
@@ -205,37 +216,45 @@ def write_split(
         torch.save(graphs, shard_path)
         paths.append(shard_path)
         n_written += len(graphs)
-        graphs = []
+        graphs.clear()
         shard_idx += 1
 
     for i, row in enumerate(iter_split(hf_id, split, limit, streaming)):
-        code = _first_present(row, CODE_FIELDS)
-        if not isinstance(code, str) or not code.strip():
+        codes = _codes_from_row(row)
+        if not codes:
+            stats["no_code"] += 1
             continue
-        y = torch.tensor([_extract_label(row)], dtype=torch.long)
 
-        lang = _infer_lang(row)
-        parser = c_parser if lang == "c" else cpp_parser
+        for code, label, lang in codes:
+            parser = c_parser if lang == "c" else cpp_parser
+            node_types, edges = ast_nodes_and_edges(code, parser, max_nodes=max_nodes)
+            if not node_types:
+                other = cpp_parser if parser is c_parser else c_parser
+                node_types, edges = ast_nodes_and_edges(
+                    code, other, max_nodes=max_nodes
+                )
+            if not node_types:
+                node_types, edges = _fallback_graph(code)
+                if not node_types:
+                    stats["fallback_fail"] += 1
+                    continue
 
-        node_types, edges = ast_nodes_and_edges(code, parser, max_nodes=max_nodes)
-        if not node_types:
-            other = cpp_parser if parser is c_parser else c_parser
-            node_types, edges = ast_nodes_and_edges(code, other, max_nodes=max_nodes)
-        if not node_types:
-            node_types, edges = _fallback_graph(code)
+            if add_seq_edges and node_types:
+                edges = edges + [(j, j + 1) for j in range(len(node_types) - 1)]
 
-        if seq_edges and node_types:
-            edges = edges + [(j, j + 1) for j in range(len(node_types) - 1)]
+            x = torch.tensor([vocab.get(t, 0) for t in node_types], dtype=torch.long)
+            edge_index = edges_to_edge_index(edges, len(node_types))
+            y = torch.tensor([label], dtype=torch.long)
+            graphs.append(
+                Data(x=x, edge_index=edge_index, y=y, num_nodes=len(node_types))
+            )
+            stats["ok"] += 1
 
-        x = torch.tensor([vocab.get(t, 0) for t in node_types], dtype=torch.long)
-        edge_index = edges_to_edge_index(edges, len(node_types))
-        g = Data(x=x, edge_index=edge_index, y=y, num_nodes=len(node_types))
-        graphs.append(g)
-
-        if len(graphs) >= shard_size:
-            _flush()
+            if len(graphs) >= shard_size:
+                _flush()
 
     _flush()
+    print(f"[{split}] stats: {dict(stats)}")
     return n_written, paths
 
 
@@ -244,7 +263,7 @@ def write_split(
 # -------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Build PyG .pt graphs from a HuggingFace dataset (Big-Vul)."
+        description="Build PyG .pt graphs from HuggingFace Big-Vul (func_before/func_after)."
     )
     ap.add_argument(
         "--hf-id",
@@ -297,7 +316,7 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    seq_edges = not args.no_seq_edges
+    add_seq_edges = not args.no_seq_edges
 
     # 1) Build vocab from TRAIN only (single streaming pass)
     print(
@@ -309,7 +328,7 @@ def main():
         min_freq=args.min_freq,
         streaming=args.streaming,
         limit=args.limit,
-        seq_edges=seq_edges,
+        add_seq_edges=add_seq_edges,
     )
     (out_dir / "node_vocab.json").write_text(json.dumps(vocab, indent=2))
     print(f"    Vocab size = {len(vocab)}  (saved to {out_dir/'node_vocab.json'})")
@@ -335,7 +354,7 @@ def main():
             streaming=args.streaming,
             limit=args.limit,
             shard_size=args.shard_size,
-            seq_edges=seq_edges,
+            add_seq_edges=add_seq_edges,
         )
         total_counts[split] = n
         if (
